@@ -1,42 +1,44 @@
 {
-  "name": "backend",
-  "version": "1.0.0",
+  "name": "cberwinx-game-backend",
+  "version": "2.0.0",
   "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "db:generate": "npx prisma generate",
+    "db:push": "npx prisma db push",
+    "db:migrate": "npx prisma migrate dev",
+    "db:studio": "npx prisma studio",
+    "postinstall": "prisma generate",
+    "railway:start": "prisma generate && prisma db push && node server.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Game Backend with PostgreSQL",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "autoprefixer": "^10.4.20",
+    "@prisma/client": "^5.7.0",
     "bcrypt": "^5.1.1",
     "bcryptjs": "^2.4.3",
     "body-parser": "^1.20.3",
     "cookie-parser": "^1.4.7",
-    "cores": "^0.8.5",
     "cors": "^2.8.5",
     "crypto": "^1.0.1",
-    "csurf": "^1.10.0",
     "dotenv": "^16.4.5",
-    "engine.io": "^6.6.2",
     "express": "^4.21.1",
     "express-rate-limit": "^7.4.1",
     "express-validator": "^7.2.0",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
     "moment": "^2.30.1",
-    "mongoose": "^8.7.3",
-    "morgan": "^1.10.0",
-    "multer": "^1.4.5-lts.1",
     "nodemailer": "^6.9.16",
-    "pg": "^8.13.0",
-    "postcss": "^8.4.47",
     "socket.io": "^4.8.1"
   },
   "devDependencies": {
-    "tailwindcss": "^3.4.14"
+    "nodemon": "^3.0.2",
+    "prisma": "^5.7.0"
   }
 }

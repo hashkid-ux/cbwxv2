@@ -1,4 +1,4 @@
-// Enhanced Backend with Railway Deployment Configuration
+// server.js - Game Backend with PostgreSQL
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -6,11 +6,12 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const mongoose = require('mongoose');
 const http = require('http');
 const socketIo = require('socket.io');
+const { PrismaClient } = require('@prisma/client');
 require('dotenv').config();
 
+const prisma = new PrismaClient();
 const app = express();
 const server = http.createServer(app);
 
@@ -59,20 +60,16 @@ const apiLimiter = rateLimit({
     max: 100
 });
 
-// MongoDB Connection with Retry Logic
-const connectDB = async () => {
+// Database Connection Test
+async function connectDB() {
     try {
-        await mongoose.connect(process.env.MONGODB_URI, {
-            useNewUrlParser: true,
-            useUnifiedTopology: true,
-            serverSelectionTimeoutMS: 5000,
-        });
-        console.log('✅ MongoDB Connected');
+        await prisma.$connect();
+        console.log('✅ PostgreSQL Connected via Prisma');
     } catch (error) {
-        console.error('❌ MongoDB Connection Error:', error.message);
-        setTimeout(connectDB, 5000); // Retry after 5 seconds
+        console.error('❌ Database Connection Error:', error.message);
+        setTimeout(connectDB, 5000);
     }
-};
+}
 
 connectDB();
 
@@ -94,8 +91,17 @@ const verifyToken = async (req, res, next) => {
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const User = require('./models/User');
-        const user = await User.findById(decoded.id).select('-password');
+        const user = await prisma.user.findUnique({
+            where: { id: decoded.id },
+            select: {
+                id: true,
+                username: true,
+                email: true,
+                balance: true,
+                xp: true,
+                verified: true
+            }
+        });
         
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
@@ -120,8 +126,22 @@ let gameState = {
 
 // Improved Winning Number Algorithm
 async function generateWinningNumber(roundId) {
-    const User = require('./models/User');
-    const users = await User.find({ "currentRoundBets.roundId": roundId });
+    const users = await prisma.user.findMany({
+        where: {
+            currentRoundBets: {
+                some: {
+                    roundId: roundId
+                }
+            }
+        },
+        include: {
+            currentRoundBets: {
+                where: {
+                    roundId: roundId
+                }
+            }
+        }
+    });
     
     const betTotals = {
         size: { big: 0, small: 0 },
@@ -133,19 +153,9 @@ async function generateWinningNumber(roundId) {
         user.currentRoundBets.forEach(bet => {
             if (bet.betType === 'size') betTotals.size[bet.betValue] += bet.betAmount;
             else if (bet.betType === 'color') betTotals.color[bet.betValue] += bet.betAmount;
-            else if (bet.betType === 'number') betTotals.number[bet.betValue] += bet.betAmount;
+            else if (bet.betType === 'number') betTotals.number[parseInt(bet.betValue)] += bet.betAmount;
         });
     });
-
-    // Fair algorithm: minimize total payout while maintaining randomness
-    const numberCombos = {
-        'red-big': [9, 7],
-        'green-big': [8, 6, 5],
-        'purple-big': [5],
-        'green-small': [4, 2],
-        'red-small': [3, 1, 0],
-        'purple-small': [0]
-    };
 
     let winningNumber = Math.floor(Math.random() * 10);
     const winningSize = winningNumber >= 5 ? 'big' : 'small';
@@ -167,12 +177,32 @@ setInterval(async () => {
         io.emit('newOutcome', outcome);
 
         // Save to history
-        const History = require('./models/history');
-        await History.create(outcome);
+        await prisma.history.create({
+            data: {
+                roundId: outcome.roundId,
+                number: outcome.number,
+                color: outcome.color,
+                size: outcome.size
+            }
+        });
 
         // Process user bets
-        const User = require('./models/User');
-        const users = await User.find({ "currentRoundBets.roundId": gameState.currentRoundId });
+        const users = await prisma.user.findMany({
+            where: {
+                currentRoundBets: {
+                    some: {
+                        roundId: gameState.currentRoundId
+                    }
+                }
+            },
+            include: {
+                currentRoundBets: {
+                    where: {
+                        roundId: gameState.currentRoundId
+                    }
+                }
+            }
+        });
 
         for (const user of users) {
             let totalPayout = 0;
@@ -181,22 +211,51 @@ setInterval(async () => {
                 const isWinner = 
                     (bet.betType === 'color' && bet.betValue === outcome.color) ||
                     (bet.betType === 'size' && bet.betValue === outcome.size) ||
-                    (bet.betType === 'number' && bet.betValue === outcome.number);
+                    (bet.betType === 'number' && parseInt(bet.betValue) === outcome.number);
 
                 const multiplier = bet.betType === 'number' ? 9 : 2;
                 const houseFee = 0.03;
                 const payout = isWinner ? (bet.betAmount * multiplier * (1 - houseFee)) : 0;
 
                 totalPayout += payout;
-                user.bets.push({ ...bet.toObject(), win: isWinner, payoutAmount: payout });
+                
+                // Create bet history
+                await prisma.bet.create({
+                    data: {
+                        userId: user.id,
+                        betType: bet.betType,
+                        betValue: bet.betValue,
+                        betAmount: bet.betAmount,
+                        win: isWinner,
+                        payoutAmount: payout,
+                        roundId: bet.roundId
+                    }
+                });
             }
 
-            user.balance += totalPayout;
-            user.currentRoundBets = [];
-            await user.save();
+            // Update user balance and clear current round bets
+            await prisma.user.update({
+                where: { id: user.id },
+                data: {
+                    balance: {
+                        increment: totalPayout
+                    }
+                }
+            });
+
+            await prisma.currentRoundBet.deleteMany({
+                where: {
+                    userId: user.id,
+                    roundId: gameState.currentRoundId
+                }
+            });
 
             if (user.socketId) {
-                io.to(user.socketId).emit('balanceUpdate', { balance: user.balance });
+                const updatedUser = await prisma.user.findUnique({
+                    where: { id: user.id },
+                    select: { balance: true }
+                });
+                io.to(user.socketId).emit('balanceUpdate', { balance: updatedUser.balance });
             }
         }
 
@@ -210,22 +269,48 @@ setInterval(async () => {
     io.emit('timerUpdate', { timer: gameState.timer });
 }, 1000);
 
+// Make prisma and io available globally for routes
+app.set('prisma', prisma);
+app.set('io', io);
+
 // Routes
-app.post('/register', authLimiter, require('./routes/auth').register);
-app.post('/login', authLimiter, require('./routes/auth').login);
-app.post('/logout', require('./routes/auth').logout);
+const authRoutes = require('./routes/auth');
+const profileRoutes = require('./routes/profile');
+const walletRoutes = require('./routes/wallet');
+const gameRoutes = require('./routes/game');
+const withdrawalRoutes = require('./routes/Withdrawals');
+const depositRoutes = require('./routes/depositwithdraw');
+const notificationRoutes = require('./routes/notifications');
+const adminRoutes = require('./routes/adminroutes');
+const otpRoutes = require('./routes/otp');
+const resetPassRoutes = require('./routes/reset-pass');
+
+app.post('/register', authLimiter, authRoutes.register);
+app.post('/login', authLimiter, authRoutes.login);
+app.post('/logout', authRoutes.logout);
 app.get('/verify-token', verifyToken, (req, res) => {
     res.json({ username: req.user.username });
 });
 
 app.use('/api', apiLimiter);
-app.use('/api/profile', verifyToken, require('./routes/profile'));
-app.use('/api/wallet', verifyToken, require('./routes/wallet'));
-app.use('/api/game', verifyToken, require('./routes/game'));
+app.use('/api/profile', profileRoutes);
+app.use('/api/wallet', walletRoutes);
+app.use('/api/game', gameRoutes);
+app.use('/api', withdrawalRoutes);
+app.use('/api', depositRoutes);
+app.use('/api', notificationRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api', otpRoutes);
+app.use('/api', resetPassRoutes);
 
 // Health Check for Railway
 app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'healthy', uptime: process.uptime() });
+    res.status(200).json({ 
+        status: 'healthy', 
+        uptime: process.uptime(),
+        database: 'postgresql',
+        round: gameState.currentRoundId
+    });
 });
 
 // Socket.IO Connection
@@ -233,8 +318,10 @@ io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
     
     socket.on('register', async (userId) => {
-        const User = require('./models/User');
-        await User.findByIdAndUpdate(userId, { socketId: socket.id });
+        await prisma.user.update({
+            where: { id: userId },
+            data: { socketId: socket.id }
+        });
     });
 
     socket.on('disconnect', () => {
@@ -248,7 +335,15 @@ app.use((err, req, res, next) => {
     res.status(500).json({ message: 'Internal server error' });
 });
 
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+    await prisma.$disconnect();
+    server.close();
+});
+
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🚀 Game Server running on port ${PORT}`);
+    console.log(`🎮 Current Round: ${gameState.currentRoundId}`);
+    console.log(`🗄️  Database: PostgreSQL + Prisma`);
 });
