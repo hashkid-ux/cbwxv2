@@ -1,4 +1,4 @@
-// server.js - Game Backend with PostgreSQL
+// server.js - Complete Production Backend with File Upload
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -6,6 +6,7 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const fileUpload = require('express-fileupload');
 const http = require('http');
 const socketIo = require('socket.io');
 const { PrismaClient } = require('@prisma/client');
@@ -15,7 +16,7 @@ const prisma = new PrismaClient();
 const app = express();
 const server = http.createServer(app);
 
-// Enhanced Security Configuration
+// Security Headers
 app.use(helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
     contentSecurityPolicy: {
@@ -29,11 +30,7 @@ app.use(helmet({
 }));
 
 // CORS Configuration
-const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [
-    "http://localhost:3000",
-    "https://your-frontend-domain.vercel.app"
-];
-
+const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [];
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || allowedOrigins.includes(origin)) {
@@ -46,13 +43,27 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Enhanced Rate Limiting
+// File Upload Middleware (for deposit screenshots)
+app.use(fileUpload({
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB max
+    abortOnLimit: true,
+    createParentPath: true
+}));
+
+// Rate Limiting
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 5,
-    message: 'Too many authentication attempts, please try again later.'
+    message: 'Too many auth attempts'
+});
+
+const otpLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000,
+    max: 3,
+    message: 'Too many OTP requests'
 });
 
 const apiLimiter = rateLimit({
@@ -60,28 +71,20 @@ const apiLimiter = rateLimit({
     max: 100
 });
 
-// Database Connection Test
+// Database Connection
 async function connectDB() {
     try {
         await prisma.$connect();
-        console.log('✅ PostgreSQL Connected via Prisma');
+        console.log('✅ PostgreSQL Connected');
     } catch (error) {
-        console.error('❌ Database Connection Error:', error.message);
-        setTimeout(connectDB, 5000);
+        console.error('❌ Database Error:', error.message);
+        process.exit(1);
     }
 }
 
 connectDB();
 
-// Socket.IO Configuration
-const io = socketIo(server, {
-    cors: {
-        origin: allowedOrigins,
-        credentials: true
-    }
-});
-
-// Enhanced JWT Middleware
+// JWT Middleware
 const verifyToken = async (req, res, next) => {
     const token = req.cookies.auth_token;
     
@@ -117,146 +120,55 @@ const verifyToken = async (req, res, next) => {
     }
 };
 
-// Enhanced Game Logic
+// Socket.IO Setup
+const io = socketIo(server, {
+    cors: {
+        origin: allowedOrigins,
+        credentials: true
+    }
+});
+
+// Game State
 let gameState = {
     timer: 30,
     bettingLocked: false,
     currentRoundId: 1
 };
 
-// Improved Winning Number Algorithm
-async function generateWinningNumber(roundId) {
-    const users = await prisma.user.findMany({
-        where: {
-            currentRoundBets: {
-                some: {
-                    roundId: roundId
-                }
-            }
-        },
-        include: {
-            currentRoundBets: {
-                where: {
-                    roundId: roundId
-                }
-            }
-        }
-    });
-    
-    const betTotals = {
-        size: { big: 0, small: 0 },
-        color: { red: 0, green: 0, purple: 0 },
-        number: Array(10).fill(0)
-    };
-
-    users.forEach(user => {
-        user.currentRoundBets.forEach(bet => {
-            if (bet.betType === 'size') betTotals.size[bet.betValue] += bet.betAmount;
-            else if (bet.betType === 'color') betTotals.color[bet.betValue] += bet.betAmount;
-            else if (bet.betType === 'number') betTotals.number[parseInt(bet.betValue)] += bet.betAmount;
-        });
-    });
-
-    let winningNumber = Math.floor(Math.random() * 10);
-    const winningSize = winningNumber >= 5 ? 'big' : 'small';
+// Game Logic
+function generateWinningNumber() {
+    const number = Math.floor(Math.random() * 10);
     const colorMap = {
         0: 'purple', 1: 'red', 2: 'green', 3: 'red', 4: 'green',
         5: 'purple', 6: 'green', 7: 'red', 8: 'green', 9: 'red'
     };
-    const winningColor = colorMap[winningNumber];
-
-    return { number: winningNumber, color: winningColor, size: winningSize, roundId };
+    const color = colorMap[number];
+    const size = number >= 5 ? 'big' : 'small';
+    
+    return { number, color, size, roundId: gameState.currentRoundId };
 }
 
-// Game Timer with Socket.IO
+// Game Timer
 setInterval(async () => {
     if (gameState.timer === 0) {
         gameState.bettingLocked = true;
         
-        const outcome = await generateWinningNumber(gameState.currentRoundId);
+        const outcome = generateWinningNumber();
         io.emit('newOutcome', outcome);
 
-        // Save to history
-        await prisma.history.create({
-            data: {
-                roundId: outcome.roundId,
-                number: outcome.number,
-                color: outcome.color,
-                size: outcome.size
-            }
-        });
-
-        // Process user bets
-        const users = await prisma.user.findMany({
-            where: {
-                currentRoundBets: {
-                    some: {
-                        roundId: gameState.currentRoundId
-                    }
-                }
-            },
-            include: {
-                currentRoundBets: {
-                    where: {
-                        roundId: gameState.currentRoundId
-                    }
-                }
-            }
-        });
-
-        for (const user of users) {
-            let totalPayout = 0;
-
-            for (const bet of user.currentRoundBets) {
-                const isWinner = 
-                    (bet.betType === 'color' && bet.betValue === outcome.color) ||
-                    (bet.betType === 'size' && bet.betValue === outcome.size) ||
-                    (bet.betType === 'number' && parseInt(bet.betValue) === outcome.number);
-
-                const multiplier = bet.betType === 'number' ? 9 : 2;
-                const houseFee = 0.03;
-                const payout = isWinner ? (bet.betAmount * multiplier * (1 - houseFee)) : 0;
-
-                totalPayout += payout;
-                
-                // Create bet history
-                await prisma.bet.create({
-                    data: {
-                        userId: user.id,
-                        betType: bet.betType,
-                        betValue: bet.betValue,
-                        betAmount: bet.betAmount,
-                        win: isWinner,
-                        payoutAmount: payout,
-                        roundId: bet.roundId
-                    }
-                });
-            }
-
-            // Update user balance and clear current round bets
-            await prisma.user.update({
-                where: { id: user.id },
+        try {
+            await prisma.history.create({
                 data: {
-                    balance: {
-                        increment: totalPayout
-                    }
+                    roundId: outcome.roundId,
+                    number: outcome.number,
+                    color: outcome.color,
+                    size: outcome.size
                 }
             });
 
-            await prisma.currentRoundBet.deleteMany({
-                where: {
-                    userId: user.id,
-                    roundId: gameState.currentRoundId
-                }
-            });
-
-            if (user.socketId) {
-                const updatedUser = await prisma.user.findUnique({
-                    where: { id: user.id },
-                    select: { balance: true }
-                });
-                io.to(user.socketId).emit('balanceUpdate', { balance: updatedUser.balance });
-            }
+            await processBets(outcome);
+        } catch (error) {
+            console.error('Game processing error:', error);
         }
 
         gameState.currentRoundId++;
@@ -269,54 +181,222 @@ setInterval(async () => {
     io.emit('timerUpdate', { timer: gameState.timer });
 }, 1000);
 
-// Make prisma and io available globally for routes
-app.set('prisma', prisma);
-app.set('io', io);
+async function processBets(outcome) {
+    const users = await prisma.user.findMany({
+        where: {
+            currentRoundBets: {
+                some: {
+                    roundId: gameState.currentRoundId - 1
+                }
+            }
+        },
+        include: {
+            currentRoundBets: {
+                where: {
+                    roundId: gameState.currentRoundId - 1
+                }
+            }
+        }
+    });
+
+    for (const user of users) {
+        let totalPayout = 0;
+
+        for (const bet of user.currentRoundBets) {
+            const isWinner = 
+                (bet.betType === 'color' && bet.betValue === outcome.color) ||
+                (bet.betType === 'size' && bet.betValue === outcome.size) ||
+                (bet.betType === 'number' && parseInt(bet.betValue) === outcome.number);
+
+            const multiplier = bet.betType === 'number' ? 9 : 2;
+            const houseFee = 0.03;
+            const payout = isWinner ? (bet.betAmount * multiplier * (1 - houseFee)) : 0;
+
+            totalPayout += payout;
+            
+            await prisma.bet.create({
+                data: {
+                    userId: user.id,
+                    betType: bet.betType,
+                    betValue: bet.betValue,
+                    betAmount: bet.betAmount,
+                    win: isWinner,
+                    payoutAmount: payout,
+                    roundId: bet.roundId
+                }
+            });
+        }
+
+        await prisma.user.update({
+            where: { id: user.id },
+            data: {
+                balance: {
+                    increment: totalPayout
+                }
+            }
+        });
+
+        await prisma.currentRoundBet.deleteMany({
+            where: {
+                userId: user.id,
+                roundId: gameState.currentRoundId - 1
+            }
+        });
+
+        if (user.socketId) {
+            const updatedUser = await prisma.user.findUnique({
+                where: { id: user.id },
+                select: { balance: true }
+            });
+            io.to(user.socketId).emit('balanceUpdate', { balance: updatedUser.balance });
+        }
+    }
+}
+
+// Store gameState in app.locals for route access
+app.locals.gameState = gameState;
 
 // Routes
 const authRoutes = require('./routes/auth');
-const profileRoutes = require('./routes/profile');
-const walletRoutes = require('./routes/wallet');
 const gameRoutes = require('./routes/game');
-const withdrawalRoutes = require('./routes/Withdrawals');
-const depositRoutes = require('./routes/depositwithdraw');
-const notificationRoutes = require('./routes/notifications');
-const adminRoutes = require('./routes/adminroutes');
-const otpRoutes = require('./routes/otp');
-const resetPassRoutes = require('./routes/reset-pass');
+const walletRoutes = require('./routes/wallet');
+const profileRoutes = require('./routes/profile');
+const adminRoutes = require('./routes/admin');
 
+// Auth Routes
 app.post('/register', authLimiter, authRoutes.register);
 app.post('/login', authLimiter, authRoutes.login);
 app.post('/logout', authRoutes.logout);
+app.post('/verify-otp', otpLimiter, authRoutes.verifyOTP);
+app.post('/resend-otp', otpLimiter, authRoutes.resendOTP);
+app.post('/request-password-reset', authLimiter, authRoutes.requestPasswordReset);
+
 app.get('/verify-token', verifyToken, (req, res) => {
     res.json({ username: req.user.username });
 });
 
+// API Routes
 app.use('/api', apiLimiter);
-app.use('/api/profile', profileRoutes);
-app.use('/api/wallet', walletRoutes);
 app.use('/api/game', gameRoutes);
-app.use('/api', withdrawalRoutes);
-app.use('/api', depositRoutes);
-app.use('/api', notificationRoutes);
 app.use('/api/admin', adminRoutes);
-app.use('/api', otpRoutes);
-app.use('/api', resetPassRoutes);
 
-// Health Check for Railway
+// Wallet Routes (both paths for compatibility)
+app.use('/wallet', walletRoutes);
+app.use('/api', walletRoutes);
+
+// Profile Routes (both /profile and /api/profile for compatibility)
+app.use('/profile', profileRoutes);
+app.use('/api/profile', profileRoutes);
+
+// Notifications (direct path for frontend)
+app.get('/notifications', verifyToken, async (req, res) => {
+    const notifications = await prisma.notification.findMany({
+        where: { userId: req.user.id },
+        orderBy: { date: 'desc' },
+        take: 20
+    });
+    res.json(notifications);
+});
+
+app.post('/clear-notifications', verifyToken, async (req, res) => {
+    await prisma.notification.deleteMany({
+        where: { userId: req.user.id }
+    });
+    res.json({ message: 'Notifications cleared' });
+});
+
+// Legacy routes for frontend compatibility
+app.get('/history', async (req, res) => {
+    const limit = parseInt(req.query.limit) || 50;
+    const history = await prisma.history.findMany({
+        orderBy: { roundId: 'desc' },
+        take: limit
+    });
+    res.json(history);
+});
+
+app.get('/time-remaining', async (req, res) => {
+    res.json({ timeRemaining: gameState.timer });
+});
+
+app.get('/api/user/bet-history', async (req, res) => {
+    const username = req.query.username;
+    if (!username) {
+        return res.status(400).json({ message: 'Username required' });
+    }
+
+    const user = await prisma.user.findUnique({
+        where: { username },
+        select: { id: true }
+    });
+
+    if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+    }
+
+    const bets = await prisma.bet.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: 50
+    });
+
+    res.json({ betHistory: bets });
+});
+
+app.post('/bet', verifyToken, async (req, res) => {
+    const { betType, betValue, betAmount } = req.body;
+    const userId = req.user.id;
+
+    if (!betType || betValue === undefined || !betAmount) {
+        return res.status(400).json({ message: 'All bet fields required' });
+    }
+
+    if (betAmount <= 0) {
+        return res.status(400).json({ message: 'Invalid bet amount' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+
+    if (user.balance < betAmount) {
+        return res.status(400).json({ message: 'Insufficient balance' });
+    }
+
+    await prisma.currentRoundBet.create({
+        data: {
+            userId,
+            betType,
+            betValue: String(betValue),
+            betAmount,
+            roundId: gameState.currentRoundId
+        }
+    });
+
+    const updatedUser = await prisma.user.update({
+        where: { id: userId },
+        data: {
+            balance: { decrement: betAmount },
+            xp: { increment: 1 }
+        }
+    });
+
+    res.json({
+        message: 'Bet placed',
+        balance: updatedUser.balance,
+        xp: updatedUser.xp
+    });
+});
+
+// Health Check
 app.get('/health', (req, res) => {
     res.status(200).json({ 
-        status: 'healthy', 
-        uptime: process.uptime(),
+        status: 'healthy',
         database: 'postgresql',
         round: gameState.currentRoundId
     });
 });
 
-// Socket.IO Connection
+// Socket.IO
 io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
-    
     socket.on('register', async (userId) => {
         await prisma.user.update({
             where: { id: userId },
@@ -325,7 +405,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
+        console.log('User disconnected');
     });
 });
 
@@ -335,7 +415,7 @@ app.use((err, req, res, next) => {
     res.status(500).json({ message: 'Internal server error' });
 });
 
-// Graceful shutdown
+// Graceful Shutdown
 process.on('SIGTERM', async () => {
     await prisma.$disconnect();
     server.close();
@@ -343,7 +423,5 @@ process.on('SIGTERM', async () => {
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Game Server running on port ${PORT}`);
-    console.log(`🎮 Current Round: ${gameState.currentRoundId}`);
-    console.log(`🗄️  Database: PostgreSQL + Prisma`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });

@@ -1,4 +1,4 @@
-// routes/game.js - With Prisma
+// routes/game.js - Complete PostgreSQL/Prisma Implementation
 const express = require('express');
 const router = express.Router();
 const { PrismaClient } = require('@prisma/client');
@@ -45,14 +45,14 @@ async function checkAndUnlockRewards(userId, userXP, firstDeposit) {
 }
 
 // Place Bet
-router.post('/place-bet', verifyToken, async (req, res) => {
+router.post('/bet', verifyToken, async (req, res) => {
     try {
         const { betType, betValue, betAmount, roundId } = req.body;
         const userId = req.user.id;
 
         // Validation
         if (!betType || betValue === undefined || !betAmount || !roundId) {
-            return res.status(400).json({ message: 'All bet fields are required' });
+            return res.status(400).json({ message: 'All bet fields required' });
         }
 
         if (betAmount <= 0) {
@@ -129,53 +129,49 @@ router.get('/history', async (req, res) => {
     }
 });
 
-// Get User Bets
-router.get('/my-bets', verifyToken, async (req, res) => {
+// Get User Bet History (with username query param for frontend compatibility)
+router.get('/user/bet-history', async (req, res) => {
     try {
-        const userId = req.user.id;
+        const username = req.query.username;
         const limit = parseInt(req.query.limit) || 50;
 
+        if (!username) {
+            return res.status(400).json({ message: 'Username required' });
+        }
+
+        const user = await prisma.user.findUnique({
+            where: { username },
+            select: { id: true }
+        });
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
         const bets = await prisma.bet.findMany({
-            where: { userId },
+            where: { userId: user.id },
             orderBy: {
                 createdAt: 'desc'
             },
             take: limit
         });
 
-        res.json(bets);
+        res.json({ betHistory: bets });
     } catch (error) {
         console.error('Get bets error:', error);
         res.status(500).json({ message: 'Error fetching bets' });
     }
 });
 
-// Get Current Round Bets
-router.get('/current-bets', verifyToken, async (req, res) => {
+// Get Remaining Time
+router.get('/time-remaining', async (req, res) => {
     try {
-        const userId = req.user.id;
-
-        const currentBets = await prisma.currentRoundBet.findMany({
-            where: { userId },
-            orderBy: {
-                createdAt: 'desc'
-            }
-        });
-
-        res.json(currentBets);
+        // Access gameState from parent scope via app.locals
+        const gameState = req.app.locals.gameState || { timer: 30 };
+        res.json({ timeRemaining: gameState.timer });
     } catch (error) {
-        console.error('Get current bets error:', error);
-        res.status(500).json({ message: 'Error fetching current bets' });
+        res.status(500).json({ message: 'Error fetching time' });
     }
-});
-
-// Get Game State
-router.get('/state', (req, res) => {
-    // This would need to be passed from server.js
-    // For now, return a basic response
-    res.json({
-        message: 'Game state endpoint'
-    });
 });
 
 module.exports = router;

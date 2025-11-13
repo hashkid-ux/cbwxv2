@@ -1,216 +1,257 @@
+// routes/profile.js - Complete PostgreSQL/Prisma Implementation
 const express = require('express');
 const router = express.Router();
-require('dotenv').config();
+const { PrismaClient } = require('@prisma/client');
+const { verifyToken } = require('../middleware/authtoken');
 const bcrypt = require('bcryptjs');
 
-// Import the feedback model
+const prisma = new PrismaClient();
 
-const User = require('../models/User'); // Adjust path as needed
-const Feedback = require('../models/feedbackModel');
-const { verifyToken } = require('../middleware/authtoken'); // Assuming you have an auth middleware for token verification
-
-// XP Milestones data (defined for different XP thresholds)
 const xpMilestones = [
-    { xp: 1025, rewardAmount: 200 },
-    { xp: 3075, rewardAmount: 300 },
-    { xp: 9225, rewardAmount: 500 },
-    { xp: 27675, rewardAmount: 3000 },
-    { xp: 83025, rewardAmount: 12000 },
-    { xp: 249075, rewardAmount: 43000 },
-    { xp: 747225, rewardAmount: 65000 },
-    { xp: 2241675, rewardAmount: 160000 },
-    { xp: 6725025, rewardAmount: 230000 },
-    { xp: 20175074, rewardAmount: 540000 }
+    { xp: 0, reward: 25 },
+    { xp: 1025, reward: 200 },
+    { xp: 3075, reward: 300 },
+    { xp: 9225, reward: 500 },
+    { xp: 27675, reward: 3000 },
+    { xp: 83025, reward: 12000 },
+    { xp: 249075, reward: 43000 },
+    { xp: 747225, reward: 65000 },
+    { xp: 2241675, reward: 160000 },
+    { xp: 6725025, reward: 230000 },
+    { xp: 20175074, reward: 540000 }
 ];
 
-// GET route to fetch profile data with user details
+// Get Profile
 router.get('/profile/:username', async (req, res) => {
-    const { username } = req.params;
-    console.log('Fetching profile for username:', username);
-
     try {
-        const user = await User.findOne({ username }).select('username xp balance level rewards profile');
-        if (!user) return res.status(404).json({ message: 'User not found' });
+        const { username } = req.params;
 
-        // Filter rewards based on XP or claimed status
-        const eligibleAndClaimedRewards = user.rewards.filter(reward => 
-            user.xp >= reward.xpRequired || reward.claimed
-        ).map(reward => ({
-            ...reward.toObject(),
-            eligible: user.xp >= reward.xpRequired && !reward.claimed // Eligibility check for unclaimed rewards
-        }));
+        const user = await prisma.user.findUnique({
+            where: { username },
+            include: {
+                rewards: true
+            }
+        });
 
-        // Send profile data, including profile picture (based on the pictureName field)
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
         res.json({
             username: user.username,
             xp: user.xp,
             balance: user.balance,
-            xpProgress: (user.xp / user.levelRequired) * 100, // Example XP progress calculation
-            profilePicture: user.profile.pictureName, // Send the picture name
-            rewards: eligibleAndClaimedRewards
+            profilePicture: { pictureName: user.profilePictureName },
+            rewards: user.rewards
         });
     } catch (error) {
-        console.error('Error fetching profile:', error);
-        res.status(500).json({ message: 'Error fetching profile. Please try again later.' });
+        console.error('Profile fetch error:', error);
+        res.status(500).json({ message: 'Server error' });
     }
 });
-// PUT route to update profile picture
+
+// Update Profile Picture
 router.post('/profile/image', verifyToken, async (req, res) => {
     try {
-        // The username is extracted from the token by the verifyToken middleware
-        const username = req.user.username; // Assuming `verifyToken` middleware adds `username` to `req.user`
-
-        // Get the profile picture from the request body (which should be sent from the front-end)
         const { profilePicture } = req.body;
+        const userId = req.user.id;
 
-        // Check if the profile picture is provided
         if (!profilePicture) {
-            return res.status(400).json({ message: 'Profile picture not provided' });
+            return res.status(400).json({ message: 'Profile picture required' });
         }
 
-        // Remove the file extension from the profile picture name (e.g., 'picture.jpg' -> 'picture')
-        const profilePictureName = profilePicture.split('.').slice(0, -1).join('.'); // Remove extension (.jpg, .png, etc.)
+        // Remove extension
+        const pictureName = profilePicture.split('.').slice(0, -1).join('.');
 
-        // Find the user by the username (which is set from the token)
-        const user = await User.findOne({ username });
-        if (!user) {
-            return res.status(404).json({ message: 'User not found' });
-        }
+        await prisma.user.update({
+            where: { id: userId },
+            data: {
+                profilePictureName: pictureName
+            }
+        });
 
-        // Update the user's profile picture name (without the extension)
-        user.profile.pictureName = profilePictureName;
-
-        // Save the updated user document
-        await user.save();
-
-        res.status(200).json({ message: 'Profile picture updated successfully' });
+        res.json({ message: 'Profile picture updated' });
     } catch (error) {
-        console.error('Error updating profile picture:', error);
-        res.status(500).json({ message: 'Error updating profile picture' });
+        console.error('Profile update error:', error);
+        res.status(500).json({ message: 'Server error' });
     }
 });
 
-// POST route for claiming a reward
-router.post('/claim-reward', async (req, res) => {
-    const { username, xpRequired } = req.body;
-    
+// Claim Reward
+router.post('/claim-reward', verifyToken, async (req, res) => {
     try {
-        // Find the user by username
-        const user = await User.findOne({ username });
-        if (!user) return res.status(404).json({ message: 'User not found' });
+        const { xpRequired } = req.body;
+        const userId = req.user.id;
 
-        // Check if the user's XP is sufficient to claim the reward
-        if (user.xp < xpRequired) {
-            return res.status(400).json({ message: `You need ${xpRequired} XP to claim this reward. You have only ${user.xp} XP.` });
-        }
-
-        // Find the reward associated with the required XP
-        const reward = user.rewards.find(r => r.xpRequired === xpRequired);
-        if (!reward) return res.status(400).json({ message: 'No reward available for this XP milestone.' });
-        
-        // Check if the reward has already been claimed
-        if (reward.claimed) {
-            return res.status(400).json({ message: 'Reward already claimed.' });
-        }
-
-        // Mark the reward as claimed and update the user's balance
-        reward.claimed = true;
-        user.balance += reward.rewardAmount;
-
-        // Add a transaction entry for the reward
-        user.transactions.push({
-            amount: reward.rewardAmount,
-            type: 'Reward',
-            date: new Date()
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
+            include: { rewards: true }
         });
 
-        // Save the updated user data
-        await user.save();
+        if (!user.firstDeposit) {
+            return res.status(400).json({ message: 'First deposit required' });
+        }
 
-        // Respond with the success message
+        if (user.xp < xpRequired) {
+            return res.status(400).json({ message: 'Insufficient XP' });
+        }
+
+        const reward = user.rewards.find(r => r.xpRequired === xpRequired && !r.claimed);
+
+        if (!reward) {
+            return res.status(400).json({ message: 'Reward not found or already claimed' });
+        }
+
+        // Update reward and balance in transaction
+        await prisma.$transaction([
+            prisma.reward.update({
+                where: { id: reward.id },
+                data: { claimed: true }
+            }),
+            prisma.user.update({
+                where: { id: userId },
+                data: {
+                    balance: {
+                        increment: reward.rewardAmount
+                    }
+                }
+            }),
+            prisma.transaction.create({
+                data: {
+                    userId,
+                    amount: reward.rewardAmount,
+                    type: 'Reward'
+                }
+            })
+        ]);
+
         res.json({
-            message: `Reward of Rs. ${reward.rewardAmount} claimed successfully!`,
+            message: 'Reward claimed',
             rewardAmount: reward.rewardAmount
         });
     } catch (error) {
-        res.status(500).json({ message: 'Error claiming reward', error: error.message });
+        console.error('Claim reward error:', error);
+        res.status(500).json({ message: 'Server error' });
     }
 });
 
-// GET route to fetch user's XP and next reward milestone by username
+// Get XP Status
 router.get('/xp-status/:username', async (req, res) => {
-    const { username } = req.params;
-    
     try {
-        const user = await User.findOne({ username }).select('xp');
-        if (!user) return res.status(404).json({ message: 'User not found' });
+        const { username } = req.params;
 
-        // Find next XP milestone based on user's current XP
-        const nextMilestone = xpMilestones.find(milestone => milestone.xp > user.xp);
-        res.json({
-            currentXp: user.xp,
-            nextMilestone: nextMilestone || null // If no milestone exists, return null
-        });
-    } catch (error) {
-        res.status(500).json({ message: 'Error fetching XP status', error: error.message });
-    }
-});
-
-// Route to handle feedback submission
-router.post('/feedback', async (req, res) => {
-    const { name, email, message } = req.body;
-
-    try {
-        // Create a new feedback entry
-        const newFeedback = new Feedback({
-            name,
-            email,
-            message
+        const user = await prisma.user.findUnique({
+            where: { username },
+            select: { xp: true }
         });
 
-        // Save feedback to the database
-        await newFeedback.save();
-
-        console.log('Received feedback:', { name, email, message });
-        res.status(200).json({ message: 'Feedback submitted successfully' });
-    } catch (error) {
-        console.error('Error processing feedback:', error);
-        res.status(500).json({ message: 'Error submitting feedback' });
-    }
-});
-// Route to handle password reset (using current password and new password)
-router.post('/reset-password', verifyToken, async (req, res) => {
-    const { currentPassword, newPassword } = req.body;
-
-    try {
-        // Check if the current password and new password are the same
-        if (currentPassword === newPassword) {
-            return res.status(400).json({ message: 'New password cannot be the same as the current password' });
-        }
-
-        // Get the user from the token (user is attached in the verifyToken middleware)
-        const user = await User.findById(req.user._id);  // req.user is populated by verifyToken
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
         }
 
-        // Check if the current password matches the stored password
-        const isMatch = await bcrypt.compare(currentPassword, user.password);
-        if (!isMatch) {
-            return res.status(400).json({ message: 'Current password is incorrect' });
+        const nextMilestone = xpMilestones.find(m => m.xp > user.xp);
+
+        res.json({
+            currentXp: user.xp,
+            nextMilestone: nextMilestone || null
+        });
+    } catch (error) {
+        console.error('XP status error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Submit Feedback
+router.post('/feedback', async (req, res) => {
+    try {
+        const { name, email, message } = req.body;
+
+        if (!name || !email || !message) {
+            return res.status(400).json({ message: 'All fields required' });
         }
 
-        // Hash the new password before saving it
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
-        user.password = hashedPassword;
+        await prisma.feedback.create({
+            data: {
+                name,
+                email,
+                message
+            }
+        });
 
-        // Save the updated password
-        await user.save();
-
-        res.status(200).json({ message: 'Password reset successfully' });
+        res.json({ message: 'Feedback submitted' });
     } catch (error) {
-        console.error('Error resetting password:', error);
-        res.status(500).json({ message: 'Error resetting password. Please try again later.' });
+        console.error('Feedback error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Reset Password
+router.post('/reset-password', verifyToken, async (req, res) => {
+    try {
+        const { currentPassword, newPassword } = req.body;
+        const userId = req.user.id;
+
+        if (currentPassword === newPassword) {
+            return res.status(400).json({ message: 'New password must be different' });
+        }
+
+        const user = await prisma.user.findUnique({
+            where: { id: userId }
+        });
+
+        const isMatch = await bcrypt.compare(currentPassword, user.password);
+
+        if (!isMatch) {
+            return res.status(400).json({ message: 'Current password incorrect' });
+        }
+
+        const hashedPassword = await bcrypt.hash(newPassword, 12);
+
+        await prisma.user.update({
+            where: { id: userId },
+            data: {
+                password: hashedPassword
+            }
+        });
+
+        res.json({ message: 'Password reset successful' });
+    } catch (error) {
+        console.error('Reset password error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Get Notifications
+router.get('/notifications', verifyToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+
+        const notifications = await prisma.notification.findMany({
+            where: { userId },
+            orderBy: { date: 'desc' },
+            take: 20
+        });
+
+        res.json(notifications);
+    } catch (error) {
+        console.error('Notifications error:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Clear Notifications
+router.post('/clear-notifications', verifyToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+
+        await prisma.notification.deleteMany({
+            where: { userId }
+        });
+
+        res.json({ message: 'Notifications cleared' });
+    } catch (error) {
+        console.error('Clear notifications error:', error);
+        res.status(500).json({ message: 'Server error' });
     }
 });
 

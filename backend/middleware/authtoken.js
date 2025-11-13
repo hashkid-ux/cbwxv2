@@ -1,27 +1,20 @@
-// middleware/authtoken.js - With Prisma
+// middleware/authtoken.js - PostgreSQL/Prisma Version
 const jwt = require('jsonwebtoken');
 const { PrismaClient } = require('@prisma/client');
-const dotenv = require('dotenv');
-
-dotenv.config();
+require('dotenv').config();
 
 const prisma = new PrismaClient();
-const JWT_SECRET = process.env.JWT_SECRET;
 
-// Middleware for verifying JWT tokens
 const verifyToken = async (req, res, next) => {
     const token = req.cookies.auth_token;
 
     if (!token) {
-        return res.status(403).json({ message: 'No token provided, authorization denied.' });
+        return res.status(403).json({ message: 'Authentication required' });
     }
 
     try {
-        // Verify the JWT token using the secret key
-        const decoded = jwt.verify(token, JWT_SECRET);
-        console.log('Decoded token:', decoded);
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-        // Find user by decoded ID
         const user = await prisma.user.findUnique({
             where: { id: decoded.id },
             select: {
@@ -39,19 +32,16 @@ const verifyToken = async (req, res, next) => {
         });
 
         if (!user) {
-            return res.status(404).json({ message: 'User not found.' });
+            return res.status(404).json({ message: 'User not found' });
         }
 
         req.user = user;
         next();
     } catch (error) {
-        console.error('Token verification error:', error);
-
         if (error.name === 'TokenExpiredError') {
-            return res.status(401).json({ message: 'Token expired. Please log in again.' });
+            return res.status(401).json({ message: 'Token expired' });
         }
-
-        res.status(401).json({ message: 'Token is not valid.' });
+        res.status(401).json({ message: 'Invalid token' });
     }
 };
 

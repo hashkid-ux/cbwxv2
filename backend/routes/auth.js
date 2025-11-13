@@ -1,88 +1,79 @@
-// routes/auth.js - With Prisma
+// routes/auth.js - Secure Authentication
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { PrismaClient } = require('@prisma/client');
 const nodemailer = require('nodemailer');
-const moment = require('moment');
+const crypto = require('crypto');
 
 const prisma = new PrismaClient();
 
-// Send OTP Email Helper
-async function sendOTPEmail(email, otp) {
-    const transporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: {
-            user: process.env.EMAIL_USER,
-            pass: process.env.EMAIL_PASS
-        }
-    });
+// Email Configuration
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+    }
+});
 
+// Generate Secure OTP
+function generateOTP() {
+    return crypto.randomInt(100000, 999999).toString();
+}
+
+// Send OTP Email (NO CONSOLE LOGGING)
+async function sendOTPEmail(email, otp) {
     const mailOptions = {
         from: process.env.EMAIL_USER,
         to: email,
         subject: 'Your OTP Verification Code',
         html: `
-            <html>
-                <head>
-                    <style>
-                        body { font-family: Arial, sans-serif; background-color: #f4f4f4; margin: 0; padding: 20px; }
-                        .email-container { background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1); padding: 30px; max-width: 600px; margin: 0 auto; }
-                        h1 { font-size: 24px; color: #333333; margin-bottom: 10px; }
-                        p { font-size: 16px; color: #666666; }
-                        .otp-code { display: inline-block; font-size: 40px; font-weight: bold; color: #ffffff; background-color: #4CAF50; padding: 10px 20px; border-radius: 8px; margin-top: 20px; }
-                        .footer { font-size: 12px; color: #999999; margin-top: 30px; text-align: center; }
-                    </style>
-                </head>
-                <body>
-                    <div class="email-container">
-                        <h1>Your OTP Verification Code</h1>
-                        <p>Dear user,</p>
-                        <p>We have received a request to verify your identity. Please use the OTP code below to complete the process:</p>
-                        <div class="otp-code">${otp}</div>
-                        <p>This OTP code will expire in 5 minutes. If you did not request this, please ignore this email.</p>
-                        <div class="footer">
-                            <p>Thank you for using our service!</p>
-                            <p>If you have any questions, feel free to contact our support team.</p>
-                        </div>
-                    </div>
-                </body>
-            </html>
+            <div style="font-family: Arial, sans-serif; padding: 20px;">
+                <h2>Email Verification</h2>
+                <p>Your OTP code is:</p>
+                <h1 style="background: #4CAF50; color: white; padding: 15px; border-radius: 5px; display: inline-block;">
+                    ${otp}
+                </h1>
+                <p>This code expires in 5 minutes.</p>
+                <p>If you didn't request this, ignore this email.</p>
+            </div>
         `
     };
 
     await transporter.sendMail(mailOptions);
 }
 
-// Register Route
+// Register
 exports.register = async (req, res) => {
     try {
         const { username, email, password, referralCode } = req.body;
 
         // Validation
         if (!username || !email || !password) {
-            return res.status(400).json({ message: 'All fields are required' });
+            return res.status(400).json({ message: 'All fields required' });
         }
 
-        // Check if user exists
-        const existingUser = await prisma.user.findFirst({
+        if (password.length < 6) {
+            return res.status(400).json({ message: 'Password must be 6+ characters' });
+        }
+
+        // Check existing
+        const existing = await prisma.user.findFirst({
             where: {
-                OR: [
-                    { username: username },
-                    { email: email }
-                ]
+                OR: [{ username }, { email }]
             }
         });
 
-        if (existingUser) {
-            return res.status(400).json({ message: 'Username or email already exists' });
+        if (existing) {
+            return res.status(400).json({ message: 'Username or email exists' });
         }
 
         // Hash password
-        const hashedPassword = await bcrypt.hash(password, 10);
+        const hashedPassword = await bcrypt.hash(password, 12);
 
         // Generate OTP
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        const otpExpiration = moment().add(5, 'minutes').toDate();
+        const otp = generateOTP();
+        const otpExpiration = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
         // Create user
         const newUser = await prisma.user.create({
@@ -90,7 +81,7 @@ exports.register = async (req, res) => {
                 username,
                 email,
                 password: hashedPassword,
-                referralCode: username, // Use username as referral code
+                referralCode: username,
                 referredBy: referralCode || null,
                 otp,
                 otpExpiration
@@ -100,7 +91,7 @@ exports.register = async (req, res) => {
         // Handle referral
         if (referralCode) {
             const referrer = await prisma.user.findUnique({
-                where: { referralCode: referralCode }
+                where: { referralCode }
             });
 
             if (referrer) {
@@ -114,44 +105,88 @@ exports.register = async (req, res) => {
             }
         }
 
-        // Send OTP email
+        // Send OTP (NO LOGGING)
         try {
             await sendOTPEmail(email, otp);
         } catch (error) {
-            console.error('Error sending OTP:', error);
+            console.error('Email send failed');
         }
 
         res.status(201).json({ 
-            message: 'User registered successfully. Please verify your email with the OTP sent.',
+            message: 'Registration successful. Check your email for OTP.',
             userId: newUser.id 
         });
     } catch (error) {
-        console.error('Registration error:', error);
-        res.status(500).json({ message: 'Server error during registration' });
+        console.error('Registration error');
+        res.status(500).json({ message: 'Server error' });
     }
 };
 
-// Login Route
+// Verify OTP
+exports.verifyOTP = async (req, res) => {
+    try {
+        const { email, otp } = req.body;
+
+        if (!email || !otp) {
+            return res.status(400).json({ message: 'Email and OTP required' });
+        }
+
+        const user = await prisma.user.findUnique({ where: { email } });
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        if (user.verified) {
+            return res.status(400).json({ message: 'Already verified' });
+        }
+
+        // Check expiration
+        if (new Date() > user.otpExpiration) {
+            return res.status(400).json({ message: 'OTP expired' });
+        }
+
+        // Verify OTP
+        if (user.otp !== otp) {
+            return res.status(400).json({ message: 'Invalid OTP' });
+        }
+
+        // Update user
+        await prisma.user.update({
+            where: { id: user.id },
+            data: {
+                verified: true,
+                otp: null,
+                otpExpiration: null
+            }
+        });
+
+        res.json({ message: 'Email verified successfully' });
+    } catch (error) {
+        console.error('OTP verification error');
+        res.status(500).json({ message: 'Server error' });
+    }
+};
+
+// Login
 exports.login = async (req, res) => {
     try {
-        const { username, password } = req.body;
+        const { email, password } = req.body;
 
-        if (!username || !password) {
-            return res.status(400).json({ message: 'Username and password are required' });
+        if (!email || !password) {
+            return res.status(400).json({ message: 'Email and password required' });
         }
 
         // Find user
-        const user = await prisma.user.findUnique({
-            where: { username }
-        });
+        const user = await prisma.user.findUnique({ where: { email } });
 
         if (!user) {
             return res.status(401).json({ message: 'Invalid credentials' });
         }
 
-        // Check if verified
+        // Check verified
         if (!user.verified) {
-            return res.status(403).json({ message: 'Please verify your email first' });
+            return res.status(403).json({ message: 'Please verify your email' });
         }
 
         // Verify password
@@ -167,12 +202,12 @@ exports.login = async (req, res) => {
             { expiresIn: '7d' }
         );
 
-        // Set cookie
+        // Set secure cookie
         res.cookie('auth_token', token, {
             httpOnly: true,
             secure: process.env.NODE_ENV === 'production',
             sameSite: 'strict',
-            maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+            maxAge: 7 * 24 * 60 * 60 * 1000
         });
 
         res.json({
@@ -182,13 +217,106 @@ exports.login = async (req, res) => {
             xp: user.xp
         });
     } catch (error) {
-        console.error('Login error:', error);
-        res.status(500).json({ message: 'Server error during login' });
+        console.error('Login error');
+        res.status(500).json({ message: 'Server error' });
     }
 };
 
-// Logout Route
+// Logout
 exports.logout = (req, res) => {
     res.clearCookie('auth_token');
     res.json({ message: 'Logged out successfully' });
 };
+
+// Resend OTP
+exports.resendOTP = async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        const user = await prisma.user.findUnique({ where: { email } });
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        if (user.verified) {
+            return res.status(400).json({ message: 'Already verified' });
+        }
+
+        const otp = generateOTP();
+        const otpExpiration = new Date(Date.now() + 5 * 60 * 1000);
+
+        await prisma.user.update({
+            where: { id: user.id },
+            data: { otp, otpExpiration }
+        });
+
+        await sendOTPEmail(email, otp);
+
+        res.json({ message: 'OTP resent successfully' });
+    } catch (error) {
+        console.error('Resend OTP error');
+        res.status(500).json({ message: 'Server error' });
+    }
+};
+
+// Password Reset Request
+exports.requestPasswordReset = async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        if (!email) {
+            return res.status(400).json({ message: 'Email required' });
+        }
+
+        const user = await prisma.user.findUnique({ where: { email } });
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        if (!user.verified) {
+            return res.status(400).json({ message: 'User not verified' });
+        }
+
+        // Generate reset token
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        const resetTokenExpiration = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+        await prisma.user.update({
+            where: { id: user.id },
+            data: {
+                resetToken,
+                resetTokenExpiration
+            }
+        });
+
+        // Send email
+        const resetLink = `${process.env.FRONTEND_URL}/reset-password/${resetToken}`;
+        
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: email,
+            subject: 'Password Reset Request',
+            html: `
+                <div style="font-family: Arial, sans-serif; padding: 20px;">
+                    <h2>Password Reset</h2>
+                    <p>Click the link below to reset your password:</p>
+                    <a href="${resetLink}" style="background: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">
+                        Reset Password
+                    </a>
+                    <p>This link expires in 1 hour.</p>
+                </div>
+            `
+        };
+
+        await transporter.sendMail(mailOptions);
+
+        res.json({ message: 'Password reset link sent to email' });
+    } catch (error) {
+        console.error('Password reset request error');
+        res.status(500).json({ message: 'Server error' });
+    }
+};
+
+module.exports = exports;
